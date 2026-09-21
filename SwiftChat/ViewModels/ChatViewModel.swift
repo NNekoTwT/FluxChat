@@ -35,6 +35,9 @@ class ChatViewModel: ObservableObject {
     @Published var showImageViewer: Bool = false
     @Published var editRequestedForMessageIndex: Int? = nil
 
+    // Authoritative token usage reported by the API for the most recent response.
+    @Published var lastUsage: TokenUsage? = nil
+
     // Model properties
     @Published var currentModel: ModelType
 
@@ -48,12 +51,40 @@ class ChatViewModel: ObservableObject {
         currentChat?.messages ?? []
     }
 
+    /// Estimated context usage for the current conversation, for the ring indicator.
+    /// The estimate mirrors `ChatQueryBuilder.buildQuery` (system prompt + rules +
+    /// last `maxMessages` messages); only already-sent content is counted.
+    var contextUsage: ContextUsageSnapshot {
+        let settings = SettingsManager.shared
+        let systemPrompt: String
+        if settings.isUsingCustomPrompt && !settings.customSystemPrompt.isEmpty {
+            systemPrompt = settings.customSystemPrompt
+        } else {
+            systemPrompt = AppConfig.shared.systemPrompt
+        }
+        let estimated = TokenEstimator.estimateContextTokens(
+            systemPrompt: systemPrompt,
+            rules: AppConfig.shared.rules,
+            messages: messages,
+            maxMessages: settings.maxMessages
+        )
+        return ContextUsageSnapshot(
+            estimatedTokens: estimated,
+            contextWindowTokens: currentModel.contextWindowTokens,
+            modelName: currentModel.displayName,
+            lastInputTokens: lastUsage?.input,
+            lastOutputTokens: lastUsage?.output
+        )
+    }
+
     // Private properties
     private var client: OpenAI?
     private var currentTask: Task<Void, Error>?
     private var streamUpdateTimer: Timer?
     private var pendingStreamUpdate: Chat?
     private var networkStatusCancellable: AnyCancellable?
+
+    private let repository = ChatRepository.shared
 
     init() {
         guard let model = AppConfig.shared.currentModel ?? AppConfig.shared.availableModels.first else {
@@ -62,13 +93,29 @@ class ChatViewModel: ObservableObject {
         self.currentModel = model
         self.isWebSearchEnabled = SettingsManager.shared.webSearchEnabled
 
-        // Create initial blank chat
-        let newChat = Chat.create(modelType: currentModel)
-        currentChat = newChat
-        chats = [newChat]
-
         setupClient()
         setupNetworkStatusObserver()
+        loadPersistedChats()
+    }
+
+    private func loadPersistedChats() {
+        let loaded = repository.loadChats()
+        guard !loaded.isEmpty else {
+            let newChat = Chat.create(modelType: currentModel)
+            currentChat = newChat
+            chats = [newChat]
+            return
+        }
+
+        chats = loaded
+        if let mostRecent = loaded.first {
+            currentChat = mostRecent
+            // Keep the runtime-selected model in sync with the restored chat.
+            if currentModel != mostRecent.modelType {
+                currentModel = mostRecent.modelType
+                AppConfig.shared.currentModel = mostRecent.modelType
+            }
+        }
     }
 
     deinit {
@@ -151,6 +198,8 @@ class ChatViewModel: ObservableObject {
                 createNewChat()
             }
         }
+
+        repository.deleteChat(id: id)
     }
 
     func updateChatTitle(_ id: String, newTitle: String) {
@@ -165,6 +214,9 @@ class ChatViewModel: ObservableObject {
         }
         if currentChat?.id == id {
             currentChat = chats[index]
+        }
+        if !chats[index].isBlankChat {
+            repository.saveChat(chats[index])
         }
     }
 
@@ -185,6 +237,7 @@ class ChatViewModel: ObservableObject {
 
         let userMessage = Message(role: .user, content: text, attachments: messageAttachments)
         addMessage(userMessage)
+        persistCurrentChat()
 
         generateResponse()
     }
@@ -537,6 +590,16 @@ class ChatViewModel: ObservableObject {
                             self.currentChat = chat
                         }
 
+                    case .completed(let event):
+                        // Capture the API's authoritative token usage for the
+                        // context indicator. May be nil on some providers.
+                        if let usage = event.response.usage {
+                            let captured = TokenUsage(input: usage.inputTokens, output: usage.outputTokens)
+                            Task { @MainActor [weak self] in
+                                self?.lastUsage = captured
+                            }
+                        }
+
                     default:
                         break
                     }
@@ -627,18 +690,21 @@ class ChatViewModel: ObservableObject {
                     self.replaceChat(chat)
                     self.currentChat = chat
                     self.isLoading = false
+                    self.repository.saveChat(chat)
 
                     // Generate title if needed
                     if chat.needsGeneratedTitle && chat.messages.count >= 2 {
                         Task {
                             if let generated = await self.generateLLMTitle(from: chat.messages) {
-                                if var updatedChat = self.chats.first(where: { $0.id == chat.id }) {
+                                if var updatedChat = self.chats.first(where: { $0.id == chat.id }),
+                                   updatedChat.titleState == .placeholder {
                                     updatedChat.title = generated
                                     updatedChat.titleState = .generated
                                     self.replaceChat(updatedChat)
                                     if self.currentChat?.id == updatedChat.id {
                                         self.currentChat = updatedChat
                                     }
+                                    self.repository.saveChat(updatedChat)
                                     Chat.triggerSuccessFeedback()
                                 }
                             }
@@ -646,6 +712,11 @@ class ChatViewModel: ObservableObject {
                     }
                 }
             } catch {
+                print("========== AI ERROR ==========")
+                    print("Error type:", type(of: error))
+                    print("Error:", String(reflecting: error))
+                    print("Localized:", error.localizedDescription)
+                    print("==============================")
                 let shouldRetry = await MainActor.run {
                     if !hasRetriedWithFreshKey && ChatViewModel.isAuthenticationError(error) { return true }
                     return false
@@ -673,6 +744,7 @@ class ChatViewModel: ObservableObject {
                         }
                         self.replaceChat(chat)
                         self.currentChat = chat
+                        self.repository.saveChat(chat)
                     }
                 }
             }
@@ -688,8 +760,15 @@ class ChatViewModel: ObservableObject {
 
         if var chat = currentChat {
             chat.hasActiveStream = false
+            if !chat.messages.isEmpty,
+               chat.messages[chat.messages.count - 1].role == .assistant {
+                chat.messages[chat.messages.count - 1].isThinking = false
+            }
             replaceChat(chat)
             currentChat = chat
+            if !chat.isBlankChat {
+                repository.saveChat(chat)
+            }
         }
     }
 
@@ -701,6 +780,7 @@ class ChatViewModel: ObservableObject {
         updatedChat.messages = Array(chat.messages.prefix(lastUserMessageIndex + 1))
         replaceChat(updatedChat)
         currentChat = updatedChat
+        persistCurrentChat()
 
         isScrollInteractionActive = false
         scrollToUserMessageTrigger = UUID()
@@ -727,6 +807,7 @@ class ChatViewModel: ObservableObject {
 
         let userMessage = Message(role: .user, content: trimmedContent)
         addMessage(userMessage)
+        persistCurrentChat()
         generateResponse()
     }
 
@@ -741,6 +822,7 @@ class ChatViewModel: ObservableObject {
         updatedChat.messages = Array(chat.messages.prefix(messageIndex + 1))
         replaceChat(updatedChat)
         currentChat = updatedChat
+        persistCurrentChat()
 
         isScrollInteractionActive = false
         scrollToUserMessageTrigger = UUID()
@@ -762,6 +844,9 @@ class ChatViewModel: ObservableObject {
             chat.modelType = modelType
             replaceChat(chat)
             currentChat = chat
+            if !chat.isBlankChat {
+                repository.saveChat(chat)
+            }
         }
     }
 
@@ -791,6 +876,11 @@ class ChatViewModel: ObservableObject {
         } else if !updatedChat.isBlankChat {
             chats.insert(updatedChat, at: min(1, chats.count))
         }
+    }
+
+    private func persistCurrentChat() {
+        guard let chat = currentChat, !chat.isBlankChat else { return }
+        repository.saveChat(chat)
     }
 
     private func refreshClientForRetry() async {
@@ -893,6 +983,7 @@ class ChatViewModel: ObservableObject {
 // MARK: - LLM Title Generation
 extension ChatViewModel {
     fileprivate func generateLLMTitle(from messages: [Message]) async -> String? {
+        print("[ChatTitle] Starting title generation for \(messages.count) message(s).")
         guard let assistantMessage = messages.first(where: { $0.role == .assistant }),
               !assistantMessage.content.isEmpty else { return nil }
 
@@ -912,6 +1003,9 @@ extension ChatViewModel {
                 model: titleModelConfig.modelName,
                 instructions: Constants.TitleGeneration.systemPrompt,
                 maxOutputTokens: 50,
+                reasoning: Components.Schemas.Reasoning(
+                    effort: Components.Schemas.ReasoningEffort.none
+                ),
                 stream: true
             )
 
@@ -925,8 +1019,13 @@ extension ChatViewModel {
 
             let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
                 .replacingOccurrences(of: "\"", with: "")
-            return cleaned.isEmpty ? nil : cleaned
+            if cleaned.isEmpty {
+                print("[ChatTitle] Title generation returned empty content.")
+                return nil
+            }
+            return cleaned
         } catch {
+            print("[ChatTitle] Failed to generate title: \(error)")
             return nil
         }
     }

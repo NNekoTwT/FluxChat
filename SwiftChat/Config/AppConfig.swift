@@ -17,11 +17,48 @@ struct ModelType: Identifiable, Codable, Hashable, Equatable {
     let fullName: String
     let iconName: String
     let isMultimodal: Bool
+    /// Maximum context window size, in tokens.
+    let contextWindowTokens: Int
 
     var modelName: String { id }
 
+    /// Fallback context window used when a model's window is unknown (legacy data
+    /// or an unknown model id). Matches DeepSeek V4 Pro's 1M window.
+    static let fallbackContextWindowTokens = 1_048_576
+
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: ModelType, rhs: ModelType) -> Bool { lhs.id == rhs.id }
+
+    init(
+        id: String,
+        displayName: String,
+        fullName: String,
+        iconName: String,
+        isMultimodal: Bool,
+        contextWindowTokens: Int
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.fullName = fullName
+        self.iconName = iconName
+        self.isMultimodal = isMultimodal
+        self.contextWindowTokens = contextWindowTokens
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, displayName, fullName, iconName, isMultimodal, contextWindowTokens
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        fullName = try container.decode(String.self, forKey: .fullName)
+        iconName = try container.decode(String.self, forKey: .iconName)
+        isMultimodal = try container.decode(Bool.self, forKey: .isMultimodal)
+        contextWindowTokens = try container.decodeIfPresent(Int.self, forKey: .contextWindowTokens)
+            ?? ModelType.fallbackContextWindowTokens
+    }
 }
 
 /// Application-wide configuration
@@ -32,10 +69,10 @@ class AppConfig: ObservableObject {
     // MARK: - Configuration
 
     /// Set your API key here or via environment
-    var apiKey: String = "YOUR_API_KEY"
+    var apiKey: String = "YOUR_APIKEY"
 
     /// OpenAI-compatible API host (no scheme, no path)
-    var apiHost: String = "api.openai.com"
+    var apiHost: String = "api.deepseek.com"
 
     /// Base path for the API
     var apiBasePath: String = "/v1"
@@ -71,9 +108,14 @@ class AppConfig: ObservableObject {
     /// Override this to change available models
     private func setupDefaultModels() {
         availableModels = [
-            ModelType(id: "gpt-4.1", displayName: "GPT-4.1", fullName: "GPT-4.1", iconName: "openai-icon", isMultimodal: true),
-            ModelType(id: "gpt-4.1-mini", displayName: "GPT-4.1 Mini", fullName: "GPT-4.1 Mini", iconName: "openai-icon", isMultimodal: true),
-            ModelType(id: "o4-mini", displayName: "o4-mini", fullName: "o4-mini", iconName: "openai-icon", isMultimodal: true),
+            ModelType(
+                id: "deepseek-v4-pro",
+                displayName: "DeepSeek V4 Pro",
+                fullName: "DeepSeek V4 Pro",
+                iconName: "openai-icon",
+                isMultimodal: true,
+                contextWindowTokens: 1_048_576
+            )
         ]
     }
 
@@ -92,7 +134,7 @@ class AppConfig: ObservableObject {
 
     /// The model used for generating chat titles (nil = skip title generation)
     var titleModel: ModelType? {
-        availableModels.first(where: { $0.id == "gpt-4.1-mini" }) ?? availableModels.first
+        availableModels.first
     }
 
     // MARK: - OpenAI Client
@@ -100,8 +142,10 @@ class AppConfig: ObservableObject {
     func makeClient() -> OpenAI {
         let config = OpenAI.Configuration(
             token: apiKey,
-            host: apiHost,
-            basePath: apiBasePath
+            host: "api.deepseek.com",
+            scheme: "https",
+            basePath: apiBasePath,
+            parsingOptions: .relaxed
         )
         return OpenAI(configuration: config)
     }

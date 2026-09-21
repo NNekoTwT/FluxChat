@@ -99,6 +99,9 @@ struct ChatQueryBuilder {
             input: .inputItemList(inputItems),
             model: modelId,
             instructions: fullPrompt,
+            reasoning: Components.Schemas.Reasoning(
+                effort: Components.Schemas.ReasoningEffort.none
+            ),
             stream: stream ? true : nil,
             tools: tools
         )

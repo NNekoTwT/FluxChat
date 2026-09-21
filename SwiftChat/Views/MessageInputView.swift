@@ -141,6 +141,7 @@ struct MessageInputView: View {
                         .padding(.horizontal)
 
                     HStack {
+                        contextUsageRing
                         attachButton
                         webSearchButton
                         Spacer()
@@ -190,6 +191,7 @@ struct MessageInputView: View {
                         .padding(.horizontal)
 
                     HStack {
+                        contextUsageRing
                         attachButton
                         webSearchButton
                         Spacer()
@@ -218,6 +220,12 @@ struct MessageInputView: View {
             .padding(.horizontal, 12)
             .padding(.bottom, isKeyboardVisible ? 12 : 0)
         }
+    }
+
+    @ViewBuilder
+    private var contextUsageRing: some View {
+        ContextUsageRingView(usage: viewModel.contextUsage)
+            .padding(.leading, 8)
     }
 
     @ViewBuilder
